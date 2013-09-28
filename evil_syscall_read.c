@@ -48,9 +48,6 @@ orig_read_t origin_syscall = NULL;
 // Pointer to sys call table
 sys_call_ptr_t*_sys_call_table = NULL;
 
-// kthread status
-int kthread_status;
-
 // check value
 int check = 0;
 
